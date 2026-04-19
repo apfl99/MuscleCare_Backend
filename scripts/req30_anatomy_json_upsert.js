@@ -20,6 +20,12 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 const EXERCISES_JSON_PATH = process.env.EXERCISES_JSON_PATH
   ? path.resolve(process.env.EXERCISES_JSON_PATH)
   : path.resolve(process.cwd(), "exercises.json");
+const ANATOMY_TAXONOMY_PATH = process.env.ANATOMY_TAXONOMY_PATH
+  ? path.resolve(process.env.ANATOMY_TAXONOMY_PATH)
+  : path.resolve(process.cwd(), "config/anatomy_taxonomy.v1.json");
+const REVIEW_REPORT_PATH = process.env.REVIEW_REPORT_PATH
+  ? path.resolve(process.env.REVIEW_REPORT_PATH)
+  : path.resolve(process.cwd(), "reports/req30_exercise_review_required.json");
 
 if (!SUPABASE_SERVICE_ROLE_KEY) {
   console.error("SUPABASE_SERVICE_ROLE_KEY is required.");
@@ -37,56 +43,36 @@ function toSnake(raw) {
   return normalized || null;
 }
 
-const MUSCLE_ALIAS_TO_CANONICAL = {
-  chest: "chest",
-  upper_chest: "upper_chest",
-  serratus_anterior: "serratus_anterior",
-  shoulders: "shoulders",
-  shoulder: "shoulders",
-  deltoids: "shoulders",
-  front_deltoid: "front_deltoid",
-  lateral_deltoid: "lateral_deltoid",
-  rear_deltoid: "rear_deltoid",
-  traps: "traps",
-  trapezius: "traps",
-  upper_trapezius: "upper_trapezius",
-  middle_trapezius: "middle_trapezius",
-  lower_trapezius: "lower_trapezius",
-  lats: "lats",
-  middle_back: "middle_back",
-  middleback: "middle_back",
-  rhomboids: "rhomboids",
-  lower_back: "lower_back",
-  lowerback: "lower_back",
-  spinal_erectors: "spinal_erectors",
-  erector_spinae: "spinal_erectors",
-  biceps: "biceps",
-  triceps: "triceps",
-  forearms: "forearms",
-  forearm: "forearms",
-  forearm_flexors: "forearm_flexors",
-  forearm_extensors: "forearm_extensors",
-  abdominals: "abdominals",
-  core: "abdominals",
-  transverse_abdominis: "transverse_abdominis",
-  abs: "abs",
-  rectus_abdominis: "abs",
-  obliques: "obliques",
-  hip_flexors: "hip_flexors",
-  glutes: "glutes",
-  abductors: "abductors",
-  adductors: "adductors",
-  quadriceps: "quadriceps",
-  hamstrings: "hamstrings",
-  calves: "calves",
-  tibialis_anterior: "tibialis_anterior",
-  neck: "neck",
-};
+const taxonomy = JSON.parse(fs.readFileSync(ANATOMY_TAXONOMY_PATH, "utf8"));
+const DETAILED_MUSCLE_SET = new Set(taxonomy.detailed_muscle_codes ?? []);
+const GROUP_TO_DETAILED = taxonomy.group_to_detailed ?? {};
+const legacyAliases = taxonomy.legacy_aliases ?? {};
 
-function toCanonicalMuscleCode(raw) {
+const ALIAS_TO_TARGET = {};
+for (const [targetCode, aliases] of Object.entries(legacyAliases)) {
+  ALIAS_TO_TARGET[targetCode] = targetCode;
+  for (const alias of aliases) {
+    const normalizedAlias = toSnake(alias);
+    if (normalizedAlias) {
+      ALIAS_TO_TARGET[normalizedAlias] = targetCode;
+    }
+  }
+}
+for (const group of Object.keys(GROUP_TO_DETAILED)) {
+  ALIAS_TO_TARGET[group] = group;
+}
+
+function resolveMuscleCodes(raw) {
   const snake = toSnake(raw);
-  if (!snake) return null;
-  return MUSCLE_ALIAS_TO_CANONICAL[snake] ?? null;
+  if (!snake) return [];
+  if (DETAILED_MUSCLE_SET.has(snake)) return [snake];
+  if (GROUP_TO_DETAILED[snake]) return GROUP_TO_DETAILED[snake];
+
+  const target = ALIAS_TO_TARGET[snake];
+  if (!target) return [];
+  if (DETAILED_MUSCLE_SET.has(target)) return [target];
+  if (GROUP_TO_DETAILED[target]) return GROUP_TO_DETAILED[target];
+  return [];
 }
 
 function normalizeText(raw) {
@@ -98,11 +84,21 @@ function normalizeText(raw) {
 function normalizeMuscles(input) {
   const array = Array.isArray(input) ? input : [];
   const set = new Set();
+  const unresolved = [];
   for (const item of array) {
-    const normalized = toCanonicalMuscleCode(item);
-    if (normalized) set.add(normalized);
+    const resolved = resolveMuscleCodes(item);
+    if (resolved.length === 0) {
+      unresolved.push(String(item));
+      continue;
+    }
+    for (const code of resolved) {
+      set.add(code);
+    }
   }
-  return Array.from(set);
+  return {
+    codes: Array.from(set),
+    unresolved,
+  };
 }
 
 function inferCategory(sourceCategory, sourceEquipment) {
@@ -132,16 +128,14 @@ function inferExerciseType(category) {
 function inferMuscleSize(exerciseType, primaryMuscles) {
   if (exerciseType === "cardio") return "large";
   const largeSet = new Set([
-    "chest",
-    "upper_chest",
-    "lats",
-    "middle_back",
-    "lower_back",
-    "traps",
-    "spinal_erectors",
+    "pectoralis_major_sternocostal",
+    "latissimus_dorsi",
+    "trapezius_descending",
+    "trapezius_transverse",
+    "trapezius_ascending",
     "quadriceps",
     "hamstrings",
-    "glutes",
+    "gluteus_maximus",
     "adductors",
     "abductors",
   ]);
@@ -172,6 +166,22 @@ function buildBiomechanicsNote(item) {
     return `force=${parts[0] ?? "-"}, level=${parts[1] ?? "-"}, mechanic=${parts[2] ?? "-"}`;
   }
   return null;
+}
+
+function inferFallbackPrimary(category) {
+  if (category === "cardio") {
+    return ["quadriceps"];
+  }
+  if (category === "machine" || category === "free_weight") {
+    return ["pectoralis_major_sternocostal"];
+  }
+  if (category === "cable") {
+    return ["latissimus_dorsi"];
+  }
+  if (category === "bodyweight") {
+    return ["rectus_abdominis"];
+  }
+  return ["rectus_abdominis"];
 }
 
 function requestJson({ method, path, headers = {}, body }) {
@@ -293,6 +303,14 @@ async function main() {
 
   const updates = [];
   const inserts = [];
+  const reviewRequired = [];
+  const quality = {
+    unresolvedTokens: 0,
+    duplicateResolved: 0,
+    autoPromotedFromSecondary: 0,
+    fallbackPrimaryAssigned: 0,
+    invalidBiomechanics: 0,
+  };
   let skipped = 0;
 
   for (const item of raw) {
@@ -318,12 +336,60 @@ async function main() {
       }
     }
 
-    const primaryMuscles = normalizeMuscles(
+    const primaryResult = normalizeMuscles(
       item.primary_muscles ?? item.primaryMuscles ?? []
     );
-    const secondaryMuscles = normalizeMuscles(
+    const secondaryResult = normalizeMuscles(
       item.secondary_muscles ?? item.secondaryMuscles ?? []
     );
+    let primaryMuscles = primaryResult.codes;
+    let secondaryMuscles = secondaryResult.codes;
+
+    const unresolved = [...primaryResult.unresolved, ...secondaryResult.unresolved];
+    quality.unresolvedTokens += unresolved.length;
+    const overlap = secondaryMuscles.filter((code) => primaryMuscles.includes(code));
+    if (overlap.length > 0) {
+      quality.duplicateResolved += overlap.length;
+      secondaryMuscles = secondaryMuscles.filter((code) => !primaryMuscles.includes(code));
+    }
+
+    if (primaryMuscles.length === 0 && secondaryMuscles.length > 0) {
+      primaryMuscles = [secondaryMuscles[0]];
+      secondaryMuscles = secondaryMuscles.slice(1);
+      quality.autoPromotedFromSecondary += 1;
+    }
+
+    const inferredCategory = inferCategory(item.category, item.equipment);
+    if (primaryMuscles.length === 0) {
+      primaryMuscles = inferFallbackPrimary(inferredCategory).filter((code) =>
+        DETAILED_MUSCLE_SET.has(code)
+      );
+      quality.fallbackPrimaryAssigned += 1;
+    }
+
+    if (primaryMuscles.length === 0) {
+      quality.invalidBiomechanics += 1;
+      reviewRequired.push({
+        name: nameEn ?? nameKo ?? "unknown",
+        reason: "primary_empty_after_fallback",
+        unresolved,
+        sourcePrimary: item.primary_muscles ?? item.primaryMuscles ?? [],
+        sourceSecondary: item.secondary_muscles ?? item.secondaryMuscles ?? [],
+      });
+      skipped += 1;
+      continue;
+    }
+
+    if (unresolved.length > 0) {
+      reviewRequired.push({
+        name: nameEn ?? nameKo ?? "unknown",
+        reason: "unresolved_tokens",
+        unresolved,
+        primary_muscles: primaryMuscles,
+        secondary_muscles: secondaryMuscles,
+      });
+    }
+
     const biomechanicsNote = buildBiomechanicsNote(item);
 
     if (matched) {
@@ -351,7 +417,6 @@ async function main() {
     }
     usedSlugs.add(slug);
 
-    const inferredCategory = inferCategory(item.category, item.equipment);
     const exerciseType = inferExerciseType(inferredCategory);
     const muscleSize = inferMuscleSize(exerciseType, primaryMuscles);
     const equipment = normalizeText(item.equipment) ?? "unknown";
@@ -390,8 +455,25 @@ async function main() {
     updatedExisting: updates.length,
     insertedNew: inserts.length,
     skipped,
+    reviewRequired: reviewRequired.length,
+    quality,
     finishedAt: new Date().toISOString(),
   };
+
+  fs.mkdirSync(path.dirname(REVIEW_REPORT_PATH), { recursive: true });
+  fs.writeFileSync(
+    REVIEW_REPORT_PATH,
+    JSON.stringify(
+      {
+        sourceFile: EXERCISES_JSON_PATH,
+        generatedAt: new Date().toISOString(),
+        reviewRequired,
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
 
   console.log(JSON.stringify(summary, null, 2));
 }
